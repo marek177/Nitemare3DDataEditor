@@ -33,19 +33,86 @@ public static class AudioCodec
         int outRate = 0, outBits = 0, outChannels = 0, currentCodec = -1;
         int? extendedRate = null, extendedChannels = null, extendedCodec = null;
 
+        // Creative codec 0x01 = Sound Blaster 8-bit -> 4-bit ADPCM.
+        // The first byte is an uncompressed predictor sample, then every byte
+        // contains two ADPCM codes (high nibble first). Continuation block 0x02
+        // keeps the predictor and adaptive step state from the previous block.
+        int creativeLast = 0;
+        int creativeStepIndex = 0;
+        bool creativeInitialized = false;
+        int[] creativeSteps = [0x100, 0x200, 0x400, 0x800];
+        int[] creativeChanges = [-1, 0, 0, 0, 0, 1, 1, 1];
+
+        void WriteS16(int sample)
+        {
+            short s = (short)Math.Clamp(sample, short.MinValue, short.MaxValue);
+            pcm.WriteByte((byte)(s & 0xFF));
+            pcm.WriteByte((byte)((s >> 8) & 0xFF));
+        }
+
+        int DecodeCreativeNibble(int code)
+        {
+            code &= 0x0F;
+            int magnitude = ((code & 7) << 1) | 1;
+            int delta = ((creativeSteps[creativeStepIndex] * magnitude) >> 1) & ~0xFF;
+            if ((code & 8) != 0) delta = -delta;
+
+            creativeLast = Math.Clamp(creativeLast + delta, short.MinValue, short.MaxValue);
+            creativeStepIndex = Math.Clamp(creativeStepIndex + creativeChanges[code & 7], 0, creativeSteps.Length - 1);
+            return creativeLast;
+        }
+
+        void DecodeCreative4(ReadOnlySpan<byte> data, bool newStream)
+        {
+            if (newStream)
+            {
+                creativeInitialized = false;
+                creativeStepIndex = 0;
+            }
+
+            int i = 0;
+            if (!creativeInitialized)
+            {
+                if (data.Length == 0)
+                    throw new InvalidDataException("VOC Creative ADPCM blok nemá úvodný predictor sample.");
+
+                // VOC Creative ADPCM predictor is unsigned 8-bit PCM.
+                creativeLast = (data[0] - 128) << 8;
+                creativeStepIndex = 0;
+                creativeInitialized = true;
+                WriteS16(creativeLast);
+                i = 1;
+            }
+
+            for (; i < data.Length; i++)
+            {
+                byte b = data[i];
+                WriteS16(DecodeCreativeNibble(b >> 4));
+                WriteS16(DecodeCreativeNibble(b & 0x0F));
+            }
+        }
+
+        int CodecOutputBits(int codec) => codec switch
+        {
+            0x00 => 8,
+            0x01 => 16, // decoded Creative 4-bit ADPCM -> signed 16-bit PCM
+            0x04 => 16,
+            _ => throw new NotSupportedException($"VOC codec 0x{codec:X} zatiaľ nie je podporovaný.")
+        };
+
         void EnsureFormat(int rate, int channels, int codec, int? bitsHint = null)
         {
-            int bits = codec switch
-            {
-                0x00 => 8,
-                0x04 => 16,
-                _ => throw new NotSupportedException($"VOC codec 0x{codec:X} zatiaľ nie je podporovaný.")
-            };
+            int bits = CodecOutputBits(codec);
 
-            if (bitsHint.HasValue && bitsHint.Value != bits)
+            // For block type 9 the stored bit depth can describe the compressed
+            // source. Codec 0x01 is 4-bit ADPCM but decodes to 16-bit PCM, so do
+            // not compare its source bit hint against the decoded WAV bit depth.
+            if (bitsHint.HasValue && codec != 0x01 && bitsHint.Value != bits)
                 throw new InvalidDataException("VOC bit depth nesúhlasí s codec ID.");
             if (rate <= 0 || channels <= 0)
                 throw new InvalidDataException("Neplatný VOC audio formát.");
+            if (codec == 0x01 && channels != 1)
+                throw new NotSupportedException("Creative VOC ADPCM codec 0x01 je zatiaľ podporovaný iba mono.");
 
             if (outRate == 0)
             {
@@ -60,10 +127,13 @@ public static class AudioCodec
             }
         }
 
-        void AppendAudio(ReadOnlySpan<byte> data, int rate, int channels, int codec, int? bitsHint = null)
+        void AppendAudio(ReadOnlySpan<byte> data, int rate, int channels, int codec, int? bitsHint = null, bool newStream = false)
         {
             EnsureFormat(rate, channels, codec, bitsHint);
-            pcm.Write(data);
+            if (codec == 0x01)
+                DecodeCreative4(data, newStream);
+            else
+                pcm.Write(data);
         }
 
         while (pos < voc.Length)
@@ -95,19 +165,18 @@ public static class AudioCodec
                     else
                     {
                         int divisor = voc[pos];
-                        if (divisor >= 256) throw new InvalidDataException("Neplatný VOC divisor.");
                         rate = (int)Math.Round(1_000_000.0 / (256 - divisor));
                         channels = 1;
                         codec = voc[pos + 1];
                     }
-                    AppendAudio(voc.AsSpan(pos + 2, len - 2), rate, channels, codec);
+                    AppendAudio(voc.AsSpan(pos + 2, len - 2), rate, channels, codec, newStream: true);
                     currentCodec = codec;
                     break;
 
                 case 0x02: // sound continuation
                     if (outRate == 0 || currentCodec < 0)
                         throw new InvalidDataException("VOC continuation bez predchádzajúceho sound bloku.");
-                    AppendAudio(voc.AsSpan(pos, len), outRate, outChannels, currentCodec, outBits);
+                    AppendAudio(voc.AsSpan(pos, len), outRate, outChannels, currentCodec, newStream: false);
                     break;
 
                 case 0x03: // silence
@@ -135,7 +204,6 @@ public static class AudioCodec
                     if (len < 4) throw new InvalidDataException("VOC extended block je príliš krátky.");
                     int tc = BinaryPrimitives.ReadUInt16LittleEndian(voc.AsSpan(pos, 2));
                     int ch = voc[pos + 3] + 1;
-                    if (tc >= 65536) throw new InvalidDataException("Neplatný VOC extended divisor.");
                     extendedRate = (int)Math.Round(256_000_000.0 / (ch * (65536 - tc)));
                     extendedCodec = voc[pos + 2];
                     extendedChannels = ch;
@@ -147,7 +215,7 @@ public static class AudioCodec
                     int newBits = voc[pos + 4];
                     int newChannels = voc[pos + 5];
                     int newCodec = BinaryPrimitives.ReadUInt16LittleEndian(voc.AsSpan(pos + 6, 2));
-                    AppendAudio(voc.AsSpan(pos + 12, len - 12), newRate, newChannels, newCodec, newBits);
+                    AppendAudio(voc.AsSpan(pos + 12, len - 12), newRate, newChannels, newCodec, newBits, newStream: true);
                     currentCodec = newCodec;
                     break;
 
