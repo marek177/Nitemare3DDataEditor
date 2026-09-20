@@ -4,7 +4,11 @@ namespace Nitemare3DDataEditor;
 
 public static class AudioCodec
 {
-    public const int DefaultSampleRate = 10989;
+    // Nitemare 3D SND.DAT PCM effects are unsigned 8-bit mono at 11025 Hz.
+    // This matches Adam Biser's N3DExtractor output byte-for-byte apart from
+    // the RIFF/WAVE header it adds around the original raw PCM payload.
+    public const int DefaultSampleRate = 11025;
+
     public static bool IsMidi(byte[] b) => b.Length >= 4 && b[0] == 'M' && b[1] == 'T' && b[2] == 'h' && b[3] == 'd';
 
     public static byte[] ToWave(byte[] pcm, int sampleRate = DefaultSampleRate)
@@ -31,4 +35,3 @@ public static class AudioCodec
         throw new InvalidDataException("Podporovaný import je 8-bit alebo 16-bit PCM WAV.");
     }
 }
-
